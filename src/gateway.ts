@@ -601,7 +601,10 @@ export class FeishuAcpGateway {
       }
     };
 
-    const finalizeTurnCard = async (finalCard: Record<string, unknown>): Promise<void> => {
+    const finalizeTurnCard = async (
+      finalCard: Record<string, unknown>,
+      fallbackText: string,
+    ): Promise<void> => {
       if (cardId) {
         try {
           const summary = (finalCard.config as { summary?: unknown } | undefined)?.summary;
@@ -633,7 +636,12 @@ export class FeishuAcpGateway {
         }
       }
 
-      await this.feishu.sendCard(target, finalCard);
+      try {
+        await this.feishu.sendCard(target, finalCard);
+      } catch (err) {
+        console.error(`[gateway] sendCard 失败，降级为纯文本回复: ${formatFeishuError(err)}`);
+        await this.feishu.sendText(target, fallbackText.slice(0, 4000));
+      }
     };
 
     let ensuredSessionId: string | null = null;
@@ -729,7 +737,10 @@ export class FeishuAcpGateway {
         forCardKit: Boolean(cardId),
       });
 
-      await finalizeTurnCard(finalCard);
+      await finalizeTurnCard(
+        finalCard,
+        chunks[0] || (isCancelled ? '本次回合已中止。' : '（本次执行未返回可见文本）'),
+      );
 
       for (let i = 1; i < chunks.length; i += 1) {
         const isLast = i === chunks.length - 1;
@@ -771,7 +782,7 @@ export class FeishuAcpGateway {
         forCardKit: Boolean(cardId),
       });
 
-      await finalizeTurnCard(errorCard);
+      await finalizeTurnCard(errorCard, `执行失败：${msg}`);
     } finally {
       if (ensuredSessionId) {
         this.inFlight.delete(turn.conversationKey);

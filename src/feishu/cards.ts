@@ -215,7 +215,7 @@ export function buildCotPanelHeader(titleContent: string): Record<string, unknow
     },
     background_color: 'grey-50',
     vertical_align: 'center',
-    padding: '4px 8px',
+    padding: '4px 8px 4px 8px',
     icon: {
       tag: 'standard_icon',
       token: 'down_outlined',
@@ -275,7 +275,7 @@ function buildCotPanel(params: {
       color: 'grey-200',
       corner_radius: '6px',
     },
-    padding: '8px 10px',
+    padding: '8px 10px 8px 10px',
     vertical_spacing: '6px',
     header: buildCotPanelHeader(params.titleContent),
     elements: [

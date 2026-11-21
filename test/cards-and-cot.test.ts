@@ -63,6 +63,8 @@ describe('Feishu Card JSON 2.0 CoT cards', () => {
     assert.ok(cotPanel);
     assert.equal(cotPanel.tag, 'collapsible_panel');
     assert.equal(cotPanel.expanded, true);
+    assert.equal(cotPanel.padding, '8px 10px 8px 10px');
+    assert.equal((cotPanel.header as { padding?: string }).padding, '4px 8px 4px 8px');
     assert.ok(cotMd && typeof cotMd.content === 'string');
     assert.ok(cotMd.content.includes('先检查配置文件'));
     assert.ok(cotMd.content.includes('read_file: src/config.ts'));
