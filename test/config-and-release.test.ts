@@ -21,6 +21,7 @@ describe('runtime config overrides & local release workflow', () => {
   it('loads explicit AGY_GATEWAY_* paths and release-meta.json metadata', () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cfg-override-'));
     const envKeys = [
+      'HOME',
       'AGY_GATEWAY_ENV_FILE',
       'AGY_GATEWAY_DATA_DIR',
       'AGY_GATEWAY_LOCK_DIR',
@@ -57,7 +58,12 @@ describe('runtime config overrides & local release workflow', () => {
         'utf8',
       );
 
-      for (const k of envKeys) delete process.env[k];
+      for (const k of envKeys) {
+        if (k !== 'HOME') delete process.env[k];
+      }
+      const fakeHome = path.join(tmpRoot, 'fake-home');
+      fs.mkdirSync(fakeHome, { recursive: true });
+      process.env.HOME = fakeHome;
       process.env.AGY_GATEWAY_ENV_FILE = envFile;
       process.env.AGY_GATEWAY_DATA_DIR = dataDir;
       process.env.AGY_GATEWAY_LOCK_DIR = lockDir;
@@ -70,7 +76,7 @@ describe('runtime config overrides & local release workflow', () => {
       assert.equal(cfg.version, '0.9.9');
       assert.equal(cfg.releaseId, '0.9.9-20261121-120000');
 
-      // When DEFAULT_CWD is blank, defaultCwd resolves to sibling `workspace` beside `dataDir` and creates it
+      // When DEFAULT_CWD is blank, defaultCwd resolves to $HOME/.agy-feishu-gateway-workspace and creates it
       const envBlankCwd = path.join(tmpRoot, 'runtime-blank-cwd.env');
       const siblingDataDir = path.join(tmpRoot, 'home-a', 'data');
       fs.writeFileSync(
@@ -82,7 +88,7 @@ describe('runtime config overrides & local release workflow', () => {
       process.env.AGY_GATEWAY_ENV_FILE = envBlankCwd;
       process.env.AGY_GATEWAY_DATA_DIR = siblingDataDir;
       const cfgAutoWorkspace = loadConfig(tmpRoot);
-      const expectedWorkspace = path.join(tmpRoot, 'home-a', 'workspace');
+      const expectedWorkspace = path.join(fakeHome, '.agy-feishu-gateway-workspace');
       assert.equal(cfgAutoWorkspace.defaultCwd, expectedWorkspace);
       assert.ok(fs.existsSync(expectedWorkspace) && fs.statSync(expectedWorkspace).isDirectory());
     } finally {

@@ -39,7 +39,7 @@ export function resolveReleaseLayout(homeOverride) {
     currentLink: path.join(homeDir, 'current'),
     envFile: path.join(homeDir, '.env'),
     dataDir: path.join(homeDir, 'data'),
-    workspaceDir: path.join(homeDir, 'workspace'),
+    workspaceDir: path.join(os.homedir(), '.agy-feishu-gateway-workspace'),
     lockDir: path.join(homeDir, 'locks'),
     binPath:
       process.env.AGY_GATEWAY_BIN_PATH?.trim() ||

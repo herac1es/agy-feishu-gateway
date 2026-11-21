@@ -130,6 +130,10 @@ export function defaultGatewayHome(): string {
   );
 }
 
+export function defaultWorkspaceDir(): string {
+  return path.join(os.homedir(), '.agy-feishu-gateway-workspace');
+}
+
 export function loadConfig(rootDir = resolvePackageRoot()): GatewayConfig {
   const envFileOverride = process.env.AGY_GATEWAY_ENV_FILE?.trim();
   const envFile = envFileOverride
@@ -162,7 +166,7 @@ export function loadConfig(rootDir = resolvePackageRoot()): GatewayConfig {
   const defaultCwdRaw = process.env.DEFAULT_CWD?.trim();
   const defaultCwd = defaultCwdRaw
     ? expandUserPath(defaultCwdRaw, rootDir)
-    : path.join(path.dirname(dataDir), 'workspace');
+    : defaultWorkspaceDir();
   if (!defaultCwdRaw) {
     fs.mkdirSync(defaultCwd, { recursive: true });
   } else if (!fs.existsSync(defaultCwd) || !fs.statSync(defaultCwd).isDirectory()) {

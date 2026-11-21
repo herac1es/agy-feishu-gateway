@@ -19,7 +19,7 @@
    - **线上运行目录**：`~/.local/share/agy-feishu-gateway/`（可通过 `AGY_GATEWAY_HOME` 覆盖）：
      - `releases/<releaseId>/`：不可变发布快照（含 `dist/`、`release-meta.json` 与独立 `prod` 依赖 `node_modules/`）。
      - `current`：原子切换的当前生效版本软链。
-     - `.env`（首次发版从开发仓复制，后续发版不覆盖）、`workspace/`（新会话默认工作目录，与 `data/` 同级）与 `data/`（`sessions.json` 跨版本保留不断聊；入站附件按会话隔离在 `data/inbound/<conversationKey>/<message_id>/`）。
+     - `.env`（首次发版从开发仓复制，后续发版不覆盖）与 `data/`（`sessions.json` 跨版本保留不断聊；入站附件按会话隔离在 `data/inbound/<conversationKey>/<message_id>/`）；新会话默认工作目录为 `~/.agy-feishu-gateway-workspace`。
      - `locks/app-<FEISHU_APP_ID>.lock`：按飞书 AppID 互斥的单实例运行锁。
    - **全局 CLI 与系统服务**：`~/.local/bin/agy-feishu-gateway` 与 `~/.config/systemd/user/agy-feishu-gateway.service`（已启用 linger，登出终端依然常驻）。
 
@@ -81,7 +81,7 @@ agy-feishu-gateway version
 - `/help`：显示指令帮助
 - `/status`：查看当前版本/发布 ID、PID、`sessionId`、工作目录、模型与思考强度
 - `/new`：关闭旧会话并立即创建新的 `agy` 会话（保留工作目录、模型与思考强度设置）
-- `/cwd <dir>`：切换当前会话工作目录（默认为与 `data` 同级的 `workspace/` 目录）
+- `/cwd <dir>`：切换当前会话工作目录（默认为 `~/.agy-feishu-gateway-workspace`）
 - `/model [model] [thought]`：查看或切换模型及思考强度，支持：
   - `/model`（查看当前配置、可选模型与思考强度）
   - `/model medium`（仅切思考强度）
