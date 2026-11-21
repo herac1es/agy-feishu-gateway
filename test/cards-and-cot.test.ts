@@ -15,9 +15,17 @@ import {
 } from '../src/feishu/cards.js';
 import {
   isCardKitPermissionError,
+  type FeishuCotEvent,
   type FeishuGatewayClient,
+  type FeishuMessageCotHandle,
   type FeishuRawMessageReceiveEvent,
+  type FeishuSendTarget,
 } from '../src/feishu/client.js';
+import {
+  COT_MAX_EVENT_CONTENT_CHARS,
+  FeishuNativeCotSession,
+  resolveCotToolIcon,
+} from '../src/feishu/cot.js';
 import { FeishuAcpGateway } from '../src/gateway.js';
 
 function getBodyElements(card: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -235,6 +243,9 @@ describe('FeishuAcpGateway CoT streaming & fallback orchestration', () => {
         stopWebSocket: () => undefined,
         getMessage: async () => null,
         downloadMessageResource: async () => '',
+        createMessageCot: async () => {
+          throw new Error('native message_cot disabled in CardKit fallback test');
+        },
         createCardEntity: async (card: Record<string, unknown>) => {
           calls.push({ op: 'createCardEntity', payload: card });
           return 'card_ent_1';
@@ -388,6 +399,9 @@ describe('FeishuAcpGateway CoT streaming & fallback orchestration', () => {
         stopWebSocket: () => undefined,
         getMessage: async () => null,
         downloadMessageResource: async () => '',
+        createMessageCot: async () => {
+          throw new Error('native message_cot disabled in patchCard fallback test');
+        },
         createCardEntity: async () => {
           createCardAttempts += 1;
           throw { response: { data: { code: 99991672, msg: 'cardkit:card:write required' } } };
@@ -451,5 +465,171 @@ describe('FeishuAcpGateway CoT streaming & fallback orchestration', () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it('streams native Feishu message_cot AG-UI events, enforces event length bounds, and sends clean final card', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-native-cot-'));
+    try {
+      const createdTargets: FeishuSendTarget[] = [];
+      const writtenEvents: FeishuCotEvent[] = [];
+      const completedHandles: FeishuMessageCotHandle[] = [];
+      const sentCards: Array<Record<string, unknown>> = [];
+      let receivedHandler: (ev: FeishuRawMessageReceiveEvent) => Promise<void> = async () => {
+        throw new Error('WebSocket handler was not registered');
+      };
+
+      const fakeFeishu = {
+        getBotInfo: async () => ({ appName: 'TestBot', openId: 'ou_bot' }),
+        startWebSocket: async (onMsg: (ev: FeishuRawMessageReceiveEvent) => Promise<void>) => {
+          receivedHandler = onMsg;
+        },
+        stopWebSocket: () => undefined,
+        getMessage: async () => null,
+        downloadMessageResource: async () => '',
+        createMessageCot: async (target: FeishuSendTarget) => {
+          createdTargets.push(target);
+          return { cotId: 'cot_native_1', messageId: 'om_cot_1' };
+        },
+        writeMessageCotEvents: async (_handle: FeishuMessageCotHandle, events: FeishuCotEvent[]) => {
+          writtenEvents.push(...events);
+        },
+        completeMessageCot: async (handle: FeishuMessageCotHandle) => {
+          completedHandles.push(handle);
+        },
+        sendCard: async (_target: unknown, card: Record<string, unknown>) => {
+          sentCards.push(card);
+          return 'om_final_1';
+        },
+      } as unknown as FeishuGatewayClient;
+
+      const longThought = '深度推理步骤内容，'.repeat(160);
+      const fakeAcp = {
+        initialize: async () => ({ protocolVersion: 1, agentInfo: { name: 'agy', version: '1.0' } }),
+        shutdown: async () => undefined,
+        ensureSession: async () => ({
+          sessionId: 'sess_native',
+          loaded: false,
+          currentModelId: 'gemini-4-neon',
+          currentThoughtLevel: 'high',
+          availableModels: [],
+          availableThoughtLevels: [],
+        }),
+        prompt: async (
+          _sessionId: string,
+          _blocks: unknown,
+          handlers: AcpPromptHandlers,
+        ): Promise<AcpPromptResult> => {
+          handlers.onThoughtChunk?.(longThought, longThought);
+          handlers.onToolEvent?.(
+            {
+              toolCallId: 'tc_1',
+              label: 'read_file: src/gateway.ts',
+              name: 'read_file',
+              kind: 'read',
+              status: 'in_progress',
+              argsText: JSON.stringify({ Path: '/repo/src/gateway.ts' }),
+            },
+            [],
+          );
+          handlers.onToolEvent?.(
+            {
+              toolCallId: 'tc_1',
+              label: 'read_file: src/gateway.ts',
+              name: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              resultText: 'file contents ok',
+            },
+            [],
+          );
+          handlers.onTextChunk?.('原生 COT 联调完成。', '原生 COT 联调完成。');
+          return {
+            stopReason: 'end_turn',
+            text: '原生 COT 联调完成。',
+            thoughtText: longThought,
+            toolEvents: [
+              {
+                toolCallId: 'tc_1',
+                label: 'read_file: src/gateway.ts',
+                name: 'read_file',
+                kind: 'read',
+                status: 'completed',
+              },
+            ],
+            usage: { totalTokens: 200 },
+          };
+        },
+      } as unknown as AgyAcpClient;
+
+      const gateway = new FeishuAcpGateway(makeConfig(tmpDir), fakeFeishu, fakeAcp);
+      await gateway.start();
+
+      await receivedHandler(makeInboundEvent('om_native_in_1', '接入原生 COT'));
+
+      // P2P creates native COT inside topic thread.
+      assert.equal(createdTargets.length, 1);
+      assert.equal(createdTargets[0].replyInThread, true);
+      assert.equal(createdTargets[0].replyToMessageId, 'om_native_in_1');
+
+      // Event sequence: RUN_STARTED -> REASONING_* -> TOOL_CALL_* -> RUN_FINISHED.
+      const types = writtenEvents.map((e) => e.event_type);
+      assert.equal(types[0], 'RUN_STARTED');
+      assert.ok(types.includes('REASONING_MESSAGE_START'));
+      assert.ok(types.filter((t) => t === 'REASONING_MESSAGE_CONTENT').length >= 2);
+      assert.ok(types.includes('REASONING_MESSAGE_END'));
+      assert.ok(types.includes('TOOL_CALL_START'));
+      assert.ok(types.includes('TOOL_CALL_ARGS'));
+      assert.ok(types.includes('TOOL_CALL_END'));
+      assert.ok(types.includes('TOOL_CALL_RESULT'));
+      assert.equal(types[types.length - 1], 'RUN_FINISHED');
+
+      // Every event content stays within Feishu payload limit, and timestamps strictly increase.
+      for (let i = 0; i < writtenEvents.length; i += 1) {
+        assert.ok(
+          writtenEvents[i].content.length <= COT_MAX_EVENT_CONTENT_CHARS,
+          `Event ${i} content length ${writtenEvents[i].content.length} exceeds ${COT_MAX_EVENT_CONTENT_CHARS}`,
+        );
+        if (i > 0) {
+          assert.ok(Number(writtenEvents[i].timestamp) > Number(writtenEvents[i - 1].timestamp));
+        }
+      }
+
+      // Formal complete endpoint was called.
+      assert.deepEqual(completedHandles, [{ cotId: 'cot_native_1', messageId: 'om_cot_1' }]);
+
+      // Only one clean final answer card was sent (no duplicate running card, no duplicate collapsible_panel).
+      assert.equal(sentCards.length, 1);
+      assert.equal(findElement(getBodyElements(sentCards[0]), CARD_ELEMENT_IDS.cotPanel), undefined);
+      assert.equal(
+        findElement(getBodyElements(sentCards[0]), CARD_ELEMENT_IDS.replyMarkdown)?.content,
+        '原生 COT 联调完成。',
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('contains native COT write errors without throwing and resolves tool icons cleanly', async () => {
+    assert.equal(resolveCotToolIcon({ kind: 'read', label: 'x' }), 'read');
+    assert.equal(resolveCotToolIcon({ kind: 'execute', label: 'x' }), 'bash');
+    assert.equal(resolveCotToolIcon({ label: 'edit_file: foo.ts' }), 'write');
+    assert.equal(resolveCotToolIcon({ label: 'search_web' }), 'search');
+
+    const session = new FeishuNativeCotSession(
+      {
+        createMessageCot: async () => ({ cotId: 'cot_err', messageId: 'om_err' }),
+        writeMessageCotEvents: async () => {
+          throw new Error('simulated 10001 error');
+        },
+        completeMessageCot: async () => undefined,
+      },
+      { chatId: 'oc_1' },
+      { runId: 'run-err', flushIntervalMs: 10 },
+    );
+
+    assert.equal(await session.start(), true);
+    session.pushThoughtDelta('some thought');
+    await session.finish({ status: 'completed' });
+    assert.equal(session.isActive(), false);
   });
 });

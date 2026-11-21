@@ -23,6 +23,7 @@ import {
   type FeishuRawMessageReceiveEvent,
   type FeishuSendTarget,
 } from './feishu/client.js';
+import { FeishuNativeCotSession } from './feishu/cot.js';
 import { normalizeInboundMessage, type NormalizedInboundTurn } from './feishu/inbound.js';
 import { MessageDeduper, SessionStore, type ConversationSessionRecord } from './store.js';
 
@@ -37,6 +38,8 @@ export class FeishuAcpGateway {
   private readonly queues = new Map<string, Promise<void>>();
   private readonly inFlight = new Map<string, InFlightTurn>();
   private botOpenId: string | null = null;
+  private nativeCotRetryAfter = 0;
+  private nativeCotWarned = false;
   private cardKitRetryAfter = 0;
   private cardKitPermissionWarned = false;
 
@@ -372,45 +375,33 @@ export class FeishuAcpGateway {
     let currentThoughtLevel = record.thoughtLevel;
     const initialStatusText = '正在连接 Antigravity 会话…';
 
-    if (Date.now() >= this.cardKitRetryAfter) {
-      try {
-        const streamingCard = buildRunningCard({
-          statusText: initialStatusText,
-          thoughtText: '',
-          toolLines: [],
-          toolCount: 0,
-          partialText: '',
-          cwd: record.cwd,
-          modelId: currentModelId,
-          thoughtLevel: currentThoughtLevel,
-          streamingMode: true,
-        });
-        const createdCardId = await this.feishu.createCardEntity(streamingCard);
-        cardMessageId = await this.feishu.sendCardEntity(target, createdCardId);
-        cardId = createdCardId;
-      } catch (err) {
-        if (isCardKitPermissionError(err)) {
-          this.cardKitRetryAfter = Date.now() + 5 * 60_000;
-          if (!this.cardKitPermissionWarned) {
-            this.cardKitPermissionWarned = true;
-            console.warn(
-              '[gateway] 飞书应用尚未开通 cardkit:card:write，已自动降级为 Card 2.0 折叠面板 + 消息更新模式（开通该权限后将自动启用 CardKit 原生流式打字机效果）。',
-            );
+    // 1. Primary path: Feishu native `im/v1/message_cot` thinking-process message.
+    let nativeCot: FeishuNativeCotSession | null = null;
+    if (Date.now() >= this.nativeCotRetryAfter) {
+      const candidate = new FeishuNativeCotSession(this.feishu, target, {
+        runId: turn.messageId || `turn-${startedAt}`,
+        onError: (err) => {
+          if (!candidate.getHandle()) {
+            this.nativeCotRetryAfter = Date.now() + 5 * 60_000;
+            if (!this.nativeCotWarned) {
+              this.nativeCotWarned = true;
+              console.warn(
+                `[gateway] 飞书原生 message_cot 创建失败，已自动降级为 Card 2.0 折叠面板模式: ${formatFeishuError(err)}`,
+              );
+            }
           }
-        } else {
-          console.warn(
-            `[gateway] CardKit 流式卡片初始化失败，降级为普通 Card 2.0 卡片: ${formatFeishuError(err)}`,
-          );
-        }
-        cardId = null;
+        },
+      });
+      if (await candidate.start()) {
+        nativeCot = candidate;
       }
     }
 
-    if (!cardMessageId) {
-      try {
-        cardMessageId = await this.feishu.sendCard(
-          target,
-          buildRunningCard({
+    // 2. Fallback path: Card 2.0 running card (CardKit streaming -> im.v1.message.patch) when native COT is unavailable.
+    if (!nativeCot) {
+      if (Date.now() >= this.cardKitRetryAfter) {
+        try {
+          const streamingCard = buildRunningCard({
             statusText: initialStatusText,
             thoughtText: '',
             toolLines: [],
@@ -419,10 +410,47 @@ export class FeishuAcpGateway {
             cwd: record.cwd,
             modelId: currentModelId,
             thoughtLevel: currentThoughtLevel,
-          }),
-        );
-      } catch (err) {
-        console.error('[gateway] 发送初始状态卡片失败:', err);
+            streamingMode: true,
+          });
+          const createdCardId = await this.feishu.createCardEntity(streamingCard);
+          cardMessageId = await this.feishu.sendCardEntity(target, createdCardId);
+          cardId = createdCardId;
+        } catch (err) {
+          if (isCardKitPermissionError(err)) {
+            this.cardKitRetryAfter = Date.now() + 5 * 60_000;
+            if (!this.cardKitPermissionWarned) {
+              this.cardKitPermissionWarned = true;
+              console.warn(
+                '[gateway] 飞书应用尚未开通 cardkit:card:write，已自动降级为 Card 2.0 折叠面板 + 消息更新模式（开通该权限后将自动启用 CardKit 原生流式打字机效果）。',
+              );
+            }
+          } else {
+            console.warn(
+              `[gateway] CardKit 流式卡片初始化失败，降级为普通 Card 2.0 卡片: ${formatFeishuError(err)}`,
+            );
+          }
+          cardId = null;
+        }
+      }
+
+      if (!cardMessageId) {
+        try {
+          cardMessageId = await this.feishu.sendCard(
+            target,
+            buildRunningCard({
+              statusText: initialStatusText,
+              thoughtText: '',
+              toolLines: [],
+              toolCount: 0,
+              partialText: '',
+              cwd: record.cwd,
+              modelId: currentModelId,
+              thoughtLevel: currentThoughtLevel,
+            }),
+          );
+        } catch (err) {
+          console.error('[gateway] 发送初始状态卡片失败:', err);
+        }
       }
     }
 
@@ -663,12 +691,13 @@ export class FeishuAcpGateway {
       schedulePatch(true);
 
       const result = await this.acp.prompt(ensured.sessionId, turn.contentBlocks, {
-        onThoughtChunk: (accumulated) => {
+        onThoughtChunk: (accumulated, delta) => {
           if (!thoughtStartedAt) {
             thoughtStartedAt = Date.now();
           }
           thoughtText = accumulated;
           statusText = '推理规划中…';
+          nativeCot?.pushThoughtDelta(delta);
           schedulePatch();
         },
         onTextChunk: (accumulated) => {
@@ -677,11 +706,13 @@ export class FeishuAcpGateway {
           }
           statusText = '正在生成回复…';
           partialText = accumulated;
+          nativeCot?.notifyReplyStarted();
           schedulePatch();
         },
         onToolEvent: (ev, all) => {
           toolEvents = all;
           statusText = `执行工具：${ev.label} (${ev.status})`;
+          nativeCot?.pushToolEvent(ev);
           schedulePatch();
         },
         onUsage: (u) => {
@@ -716,6 +747,10 @@ export class FeishuAcpGateway {
         result.stopReason === 'cancelled' ||
         Boolean(this.inFlight.get(turn.conversationKey)?.cancelRequested);
 
+      await nativeCot?.finish({
+        status: isCancelled ? 'cancelled' : 'completed',
+      });
+
       const finalThoughtText = result.thoughtText || thoughtText;
       const finalThoughtElapsedMs = thoughtStartedAt
         ? Math.max(1, (thoughtEndedAt ?? Date.now()) - thoughtStartedAt)
@@ -735,6 +770,7 @@ export class FeishuAcpGateway {
         attachmentNotes: chunks.length === 1 ? attachmentNotes : undefined,
         partLabel: chunks.length > 1 ? `1/${chunks.length}` : undefined,
         forCardKit: Boolean(cardId),
+        omitCotPanel: Boolean(nativeCot?.isActive()),
       });
 
       await finalizeTurnCard(
@@ -767,6 +803,11 @@ export class FeishuAcpGateway {
       await patchChain;
 
       const msg = err instanceof Error ? err.message : String(err);
+      await nativeCot?.finish({
+        status: 'error',
+        errorMessage: msg,
+      });
+
       const errorCard = buildFinalCard({
         status: 'error',
         text: partialText,
@@ -780,6 +821,7 @@ export class FeishuAcpGateway {
         toolEvents,
         errorText: msg,
         forCardKit: Boolean(cardId),
+        omitCotPanel: Boolean(nativeCot?.isActive()),
       });
 
       await finalizeTurnCard(errorCard, `执行失败：${msg}`);

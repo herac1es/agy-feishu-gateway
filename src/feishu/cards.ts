@@ -40,6 +40,7 @@ export interface FeishuCardBuildFinalParams {
   errorText?: string;
   partLabel?: string;
   forCardKit?: boolean;
+  omitCotPanel?: boolean;
 }
 
 function formatModelDisplay(modelId?: string, thoughtLevel?: string): string | null {
@@ -511,7 +512,9 @@ function assembleFinalCard(
 }
 
 export function buildFinalCard(params: FeishuCardBuildFinalParams): Record<string, unknown> {
-  const hasCot = Boolean(params.thoughtText?.trim()) || Boolean(params.toolEvents?.length);
+  const hasCot =
+    !params.omitCotPanel &&
+    (Boolean(params.thoughtText?.trim()) || Boolean(params.toolEvents?.length));
   let card = assembleFinalCard(params, FINAL_COT_MAX_BYTES, hasCot);
   if (!hasCot) {
     return card;

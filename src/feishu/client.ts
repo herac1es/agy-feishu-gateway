@@ -26,6 +26,17 @@ export interface FeishuSendTarget {
   replyInThread?: boolean;
 }
 
+export interface FeishuMessageCotHandle {
+  cotId: string;
+  messageId: string;
+}
+
+export interface FeishuCotEvent {
+  event_type: string;
+  content: string;
+  timestamp: string;
+}
+
 export interface FeishuRawMessageReceiveEvent {
   event_id?: string;
   token?: string;
@@ -414,6 +425,85 @@ export class FeishuGatewayClient {
           sequence,
           uuid: randomUUID(),
         },
+      }),
+    );
+  }
+
+  async createMessageCot(
+    target: FeishuSendTarget,
+    options: { hidden?: boolean } = {},
+  ): Promise<FeishuMessageCotHandle> {
+    const attempt = async (replyInThread: boolean): Promise<FeishuMessageCotHandle> => {
+      const res = assertApiOk(
+        'im.v1.message_cot.create',
+        await this.api.request<{
+          code?: number;
+          msg?: string;
+          data?: { cot_id?: string; message_id?: string };
+        }>({
+          method: 'POST',
+          url: '/open-apis/im/v1/message_cot?receive_id_type=chat_id',
+          data: {
+            receive_id: target.chatId,
+            ...(target.replyToMessageId ? { origin_message_id: target.replyToMessageId } : {}),
+            ...(replyInThread ? { reply_in_thread: true } : {}),
+            cot_hidden: options.hidden === true,
+            enable_badge: false,
+            update_feed_rank: false,
+          },
+        }),
+      );
+      const cotId = res.data?.cot_id?.trim();
+      const messageId = res.data?.message_id?.trim();
+      if (!cotId || !messageId) {
+        throw new Error('飞书 im.v1.message_cot.create 响应缺少 cot_id 或 message_id');
+      }
+      return { cotId, messageId };
+    };
+
+    if (target.replyInThread && target.replyToMessageId) {
+      try {
+        return await attempt(true);
+      } catch (err) {
+        console.warn(
+          `[feishu] message_cot 话题创建失败，降级为普通创建: ${formatFeishuError(err)}`,
+        );
+      }
+    }
+    return attempt(false);
+  }
+
+  async writeMessageCotEvents(
+    handle: FeishuMessageCotHandle,
+    events: FeishuCotEvent[],
+  ): Promise<void> {
+    if (events.length === 0) {
+      return;
+    }
+    assertApiOk(
+      'im.v1.message_cot.update',
+      await this.api.request<{ code?: number; msg?: string }>({
+        method: 'PUT',
+        url: '/open-apis/im/v1/message_cot',
+        data: {
+          cot_id: handle.cotId,
+          message_id: handle.messageId,
+          events,
+        },
+      }),
+    );
+  }
+
+  async completeMessageCot(handle: FeishuMessageCotHandle): Promise<void> {
+    assertApiOk(
+      'im.v1.message_cot.complete',
+      await this.api.request<{ code?: number; msg?: string }>({
+        method: 'POST',
+        url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(handle.cotId)}`,
+        params: {
+          message_id: handle.messageId,
+        },
+        data: {},
       }),
     );
   }

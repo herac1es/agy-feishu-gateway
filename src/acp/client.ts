@@ -24,6 +24,9 @@ export interface AcpToolEvent {
   label: string;
   status: string;
   kind?: string;
+  name?: string;
+  argsText?: string;
+  resultText?: string;
 }
 
 export interface AcpUsageSummary {
@@ -84,6 +87,54 @@ function summarizeRawInput(rawInput: unknown): string {
     }
   }
   return '';
+}
+
+function serializeBoundedValue(value: unknown, maxChars: number): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  let text: string;
+  if (typeof value === 'string') {
+    text = value.trim();
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  if (!text) {
+    return undefined;
+  }
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
+}
+
+function extractToolResultText(
+  update: { rawOutput?: unknown; content?: Array<acp.ToolCallContent> | null },
+  maxChars = 1000,
+): string | undefined {
+  const fromRaw = serializeBoundedValue(update.rawOutput, maxChars);
+  if (fromRaw) {
+    return fromRaw;
+  }
+  if (!Array.isArray(update.content) || update.content.length === 0) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  for (const item of update.content) {
+    if (item && typeof item === 'object' && 'type' in item) {
+      if (item.type === 'content' && 'content' in item && item.content?.type === 'text' && item.content.text) {
+        parts.push(item.content.text);
+      } else if (item.type === 'diff' && 'path' in item) {
+        parts.push(`diff: ${String(item.path)}`);
+      }
+    }
+  }
+  const joined = parts.join('\n').trim();
+  if (!joined) {
+    return undefined;
+  }
+  return joined.length <= maxChars ? joined : `${joined.slice(0, maxChars - 1)}…`;
 }
 
 function formatToolLabel(
@@ -362,11 +413,20 @@ export class AgyAcpClient {
       case 'tool_call_update': {
         collector.lastEventWasThought = false;
         const existing = collector.toolEventsMap.get(update.toolCallId);
+        const name =
+          typeof update.name === 'string' && update.name.trim()
+            ? update.name.trim()
+            : existing?.name;
+        const argsText = serializeBoundedValue(update.rawInput, 800) ?? existing?.argsText;
+        const resultText = extractToolResultText(update, 1000) ?? existing?.resultText;
         const event: AcpToolEvent = {
           toolCallId: update.toolCallId,
           label: formatToolLabel(update, existing),
           status: update.status ?? existing?.status ?? 'in_progress',
           kind: update.kind ?? existing?.kind,
+          name,
+          argsText,
+          resultText,
         };
         collector.toolEventsMap.set(update.toolCallId, event);
         collector.handlers.onToolEvent?.(event, Array.from(collector.toolEventsMap.values()));
