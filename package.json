@@ -1,0 +1,37 @@
+{
+  "name": "agy-feishu-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "agy-feishu-gateway": "./dist/cli.js"
+  },
+  "scripts": {
+    "start": "NODE_OPTIONS=\"--no-warnings=ExperimentalWarning ${NODE_OPTIONS:-}\" ./node_modules/.bin/tsx src/cli.ts start",
+    "check": "NODE_OPTIONS=\"--no-warnings=ExperimentalWarning ${NODE_OPTIONS:-}\" ./node_modules/.bin/tsx src/cli.ts check",
+    "version:info": "NODE_OPTIONS=\"--no-warnings=ExperimentalWarning ${NODE_OPTIONS:-}\" ./node_modules/.bin/tsx src/cli.ts version",
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test": "NODE_OPTIONS=\"--no-warnings=ExperimentalWarning ${NODE_OPTIONS:-}\" ./node_modules/.bin/tsx --test test/*.test.ts",
+    "release": "node scripts/local-release.mjs release",
+    "release:list": "node scripts/local-release.mjs list",
+    "release:rollback": "node scripts/local-release.mjs rollback",
+    "service:status": "node scripts/local-release.mjs service status",
+    "service:logs": "node scripts/local-release.mjs service logs",
+    "service:restart": "node scripts/local-release.mjs service restart",
+    "service:stop": "node scripts/local-release.mjs service stop"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^2.8.0",
+    "@larksuiteoapi/node-sdk": "^1.76.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
