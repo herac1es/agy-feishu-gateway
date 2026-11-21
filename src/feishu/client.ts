@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -97,6 +98,49 @@ function assertApiOk<T extends { code?: number; msg?: string }>(action: string, 
     throw new Error(`飞书 ${action} 失败 (code=${res.code}): ${res.msg ?? 'unknown error'}`);
   }
   return res;
+}
+
+export function extractFeishuErrorCode(err: unknown): number | undefined {
+  if (!err || typeof err !== 'object') {
+    return undefined;
+  }
+  const obj = err as {
+    code?: unknown;
+    response?: { data?: { code?: unknown } };
+  };
+  if (typeof obj.response?.data?.code === 'number') {
+    return obj.response.data.code;
+  }
+  if (typeof obj.code === 'number') {
+    return obj.code;
+  }
+  return undefined;
+}
+
+export function formatFeishuError(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const obj = err as {
+      message?: unknown;
+      response?: { data?: { code?: unknown; msg?: unknown } };
+    };
+    const data = obj.response?.data;
+    if (data && (typeof data.code === 'number' || typeof data.msg === 'string')) {
+      return `code=${data.code ?? 'unknown'}: ${data.msg ?? obj.message ?? 'unknown error'}`;
+    }
+    if (typeof obj.message === 'string' && obj.message) {
+      return obj.message;
+    }
+  }
+  return String(err);
+}
+
+export function isCardKitPermissionError(err: unknown): boolean {
+  const code = extractFeishuErrorCode(err);
+  if (code === 99991672 || code === 300311) {
+    return true;
+  }
+  const summary = formatFeishuError(err);
+  return summary.includes('cardkit:card:write') || summary.includes('99991672');
 }
 
 async function probeVideoDurationMs(videoPath: string): Promise<number | undefined> {
@@ -263,6 +307,113 @@ export class FeishuGatewayClient {
       await this.api.im.v1.message.patch({
         path: { message_id: messageId },
         data: { content: JSON.stringify(card) },
+      }),
+    );
+  }
+
+  async createCardEntity(card: Record<string, unknown>): Promise<string> {
+    const res = assertApiOk(
+      'cardkit.v1.card.create',
+      await this.api.cardkit.v1.card.create({
+        data: {
+          type: 'card_json',
+          data: JSON.stringify(card),
+        },
+      }),
+    );
+    const cardId = res.data?.card_id;
+    if (!cardId) {
+      throw new Error('飞书 cardkit.v1.card.create 响应缺少 card_id');
+    }
+    return cardId;
+  }
+
+  async sendCardEntity(target: FeishuSendTarget, cardId: string): Promise<string> {
+    return this.sendImMessage(target, 'interactive', {
+      type: 'card',
+      data: { card_id: cardId },
+    });
+  }
+
+  async streamCardElementContent(
+    cardId: string,
+    elementId: string,
+    content: string,
+    sequence: number,
+  ): Promise<void> {
+    assertApiOk(
+      'cardkit.v1.cardElement.content',
+      await this.api.cardkit.v1.cardElement.content({
+        path: {
+          card_id: cardId,
+          element_id: elementId,
+        },
+        data: {
+          content,
+          sequence,
+          uuid: randomUUID(),
+        },
+      }),
+    );
+  }
+
+  async patchCardElement(
+    cardId: string,
+    elementId: string,
+    partialElement: Record<string, unknown>,
+    sequence: number,
+  ): Promise<void> {
+    assertApiOk(
+      'cardkit.v1.cardElement.patch',
+      await this.api.cardkit.v1.cardElement.patch({
+        path: {
+          card_id: cardId,
+          element_id: elementId,
+        },
+        data: {
+          partial_element: JSON.stringify(partialElement),
+          sequence,
+          uuid: randomUUID(),
+        },
+      }),
+    );
+  }
+
+  async updateCardEntity(
+    cardId: string,
+    card: Record<string, unknown>,
+    sequence: number,
+  ): Promise<void> {
+    assertApiOk(
+      'cardkit.v1.card.update',
+      await this.api.cardkit.v1.card.update({
+        path: { card_id: cardId },
+        data: {
+          card: {
+            type: 'card_json',
+            data: JSON.stringify(card),
+          },
+          sequence,
+          uuid: randomUUID(),
+        },
+      }),
+    );
+  }
+
+  async updateCardSettings(
+    cardId: string,
+    settings: Record<string, unknown>,
+    sequence: number,
+  ): Promise<void> {
+    assertApiOk(
+      'cardkit.v1.card.settings',
+      await this.api.cardkit.v1.card.settings({
+        path: { card_id: cardId },
+        data: {
+          settings: JSON.stringify(settings),
+          sequence,
+          uuid: randomUUID(),
+        },
       }),
     );
   }

@@ -65,7 +65,8 @@ async function runCheck(): Promise<void> {
   console.log('  1. 应用可用范围：仅限你自己（或极小私密范围），网关代码不做额外白名单拦截');
   console.log('  2. 事件与回调 -> 事件配置 -> 订阅方式：选择「使用长连接接收事件」');
   console.log('  3. 已添加事件订阅：接收消息 im.message.receive_v1');
-  console.log('  4. 建议开通权限：im:message、im:message:send_as_bot、im:message.p2p_msg:readonly、im:message.group_at_msg:readonly（或 im:message.group_msg）、im:resource');
+  console.log('  4. 核心权限：im:message、im:message:send_as_bot、im:message.p2p_msg:readonly、im:message.group_at_msg:readonly（或 im:message.group_msg）、im:resource');
+  console.log('  5. 可选权限（推荐）：cardkit:card:write（启用 CardKit 原生流式打字机 CoT 思考过程；未开通时自动降级为 Card 2.0 折叠面板 + 消息更新）');
 }
 
 async function runStart(): Promise<void> {

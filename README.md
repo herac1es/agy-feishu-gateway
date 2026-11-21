@@ -6,6 +6,7 @@
 - **最大执行权限**：使用 `--dangerously-skip-permissions --include-default-customizations`（无沙箱），并在 ACP `requestPermission` 回调中自动放行。
 - **应用级权限隔离**：不在网关代码里重复写用户白名单；请直接在飞书开放平台把应用的「可用范围」限制为你本人。
 - **双向富媒体与文件通道**：支持飞书发送文本/富文本/图片/文件/视频/引用消息给 `agy`，也支持 `agy` 通过回复行指令 `[[feishu-file:/path/to/file]]` 或用户直接发 `/send <path>` 回传图片、视频与文件。
+- **CoT 思考过程展示（Card JSON 2.0 + CardKit 流式）**：通过飞书 Card 2.0 `collapsible_panel` 实时展示模型思考过程与工具调用轨迹，开始输出正文及完成后自动折叠收起；已开通 `cardkit:card:write` 时自动使用 CardKit 原生流式打字机模式，未开通时无缝降级为 `im.v1.message.patch` 更新。
 
 ---
 
@@ -65,6 +66,7 @@ agy-feishu-gateway version
    - `im:message.p2p_msg:readonly`（单聊消息）
    - `im:message.group_msg` 或 `im:message.group_at_msg:readonly`（群聊消息；若只用 `@机器人`，可将 `.env` 中 `FEISHU_GROUP_REQUIRE_MENTION=true`）
    - `im:resource`（收发图片、视频与文件资源）
+   - `cardkit:card:write`（可选推荐：开启后自动使用 CardKit 原生流式打字机展示 CoT 思考过程；未开通时自动降级为 Card 2.0 折叠面板 + `im.v1.message.patch` 更新）
 5. 修改权限或事件订阅后，务必在后台**发布新版本**使其生效。
 
 ---

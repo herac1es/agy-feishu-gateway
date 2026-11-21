@@ -66,6 +66,7 @@ export interface EnsureSessionResult extends AcpSessionConfigState {
 interface ActiveTurnCollector {
   text: string;
   thoughtText: string;
+  lastEventWasThought: boolean;
   toolEventsMap: Map<string, AcpToolEvent>;
   usage: AcpUsageSummary;
   handlers: AcpPromptHandlers;
@@ -338,6 +339,7 @@ export class AgyAcpClient {
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
         if (update.content.type === 'text' && update.content.text) {
+          collector.lastEventWasThought = false;
           collector.text += update.content.text;
           collector.handlers.onTextChunk?.(collector.text, update.content.text);
         }
@@ -345,13 +347,20 @@ export class AgyAcpClient {
       }
       case 'agent_thought_chunk': {
         if (update.content.type === 'text' && update.content.text) {
-          collector.thoughtText += update.content.text;
-          collector.handlers.onThoughtChunk?.(collector.thoughtText, update.content.text);
+          const needsBreak =
+            !collector.lastEventWasThought &&
+            collector.thoughtText.length > 0 &&
+            !collector.thoughtText.endsWith('\n');
+          const piece = needsBreak ? `\n\n${update.content.text}` : update.content.text;
+          collector.lastEventWasThought = true;
+          collector.thoughtText += piece;
+          collector.handlers.onThoughtChunk?.(collector.thoughtText, piece);
         }
         break;
       }
       case 'tool_call':
       case 'tool_call_update': {
+        collector.lastEventWasThought = false;
         const existing = collector.toolEventsMap.get(update.toolCallId);
         const event: AcpToolEvent = {
           toolCallId: update.toolCallId,
@@ -569,6 +578,7 @@ export class AgyAcpClient {
     const collector: ActiveTurnCollector = {
       text: '',
       thoughtText: '',
+      lastEventWasThought: false,
       toolEventsMap: new Map(),
       usage: {},
       handlers,
