@@ -764,6 +764,7 @@ export class AgyAcpClient {
           configState = await this.setSessionConfig(cached.sessionId, {
             modelId: needsModelSwitch ? params.modelId : undefined,
             thoughtLevel: canApplyThought ? desiredThought : undefined,
+            ignoreUnsupportedModel: true,
             ignoreUnsupportedThoughtLevel: true,
             knownThoughtLevels: configState.availableThoughtLevels,
           });
@@ -872,6 +873,7 @@ export class AgyAcpClient {
       configState = await this.setSessionConfig(sessionId, {
         modelId: needsModelSwitch ? params.modelId : undefined,
         thoughtLevel: canApplyThought ? desiredThought : undefined,
+        ignoreUnsupportedModel: true,
         ignoreUnsupportedThoughtLevel: true,
         knownThoughtLevels: configState.availableThoughtLevels,
       });
@@ -898,38 +900,61 @@ export class AgyAcpClient {
       modelId?: string;
       thoughtLevel?: string;
       knownThoughtLevels?: AcpThoughtLevelOption[];
+      ignoreUnsupportedModel?: boolean;
       ignoreUnsupportedThoughtLevel?: boolean;
     },
   ): Promise<AcpSessionConfigState> {
     const { connection } = await this.ensureConnected();
+    const existing = this.loadedSessions.get(sessionId);
     let thoughtLevelsKnown = params.knownThoughtLevels !== undefined;
     let state: AcpSessionConfigState = {
+      currentModelId: existing?.currentModelId,
       availableModels: this.getCachedModels(),
+      currentThoughtLevel: existing?.currentThoughtLevel,
       availableThoughtLevels: params.knownThoughtLevels ?? this.getCachedThoughtLevels(),
     };
 
     if (params.modelId) {
       const requestedModel = params.modelId.trim();
       let resolvedModelId = requestedModel;
+      let skipModelSwitch = false;
       if (state.availableModels.length > 0) {
         const matchedModel = state.availableModels.find(
           (m) => m.id.toLowerCase() === requestedModel.toLowerCase(),
         );
         if (!matchedModel) {
-          throw new Error(
-            `未知模型 "${requestedModel}"。可用模型：${state.availableModels.map((m) => m.id).join(', ')}`,
-          );
+          if (params.ignoreUnsupportedModel) {
+            this.log(
+              `[agy acp] 忽略已失效的持久化模型 "${requestedModel}"，保持当前默认模型 ${state.currentModelId ?? '(default)'}`,
+            );
+            skipModelSwitch = true;
+          } else {
+            throw new Error(
+              `未知模型 "${requestedModel}"。可用模型：${state.availableModels.map((m) => m.id).join(', ')}`,
+            );
+          }
+        } else {
+          resolvedModelId = matchedModel.id;
         }
-        resolvedModelId = matchedModel.id;
       }
-      const res = await connection.agent.request(acp.methods.agent.session.setConfigOption, {
-        sessionId,
-        configId: 'model',
-        value: resolvedModelId,
-      });
-      const extracted = extractConfigFromSessionResponse(res);
-      thoughtLevelsKnown = extracted.hasConfigOptions;
-      state = this.mergeCachedConfig(extracted);
+      if (!skipModelSwitch) {
+        try {
+          const res = await connection.agent.request(acp.methods.agent.session.setConfigOption, {
+            sessionId,
+            configId: 'model',
+            value: resolvedModelId,
+          });
+          const extracted = extractConfigFromSessionResponse(res);
+          thoughtLevelsKnown = extracted.hasConfigOptions;
+          state = this.mergeCachedConfig(extracted);
+        } catch (err) {
+          if (!params.ignoreUnsupportedModel) {
+            throw err;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log(`[agy acp] 忽略不可用的模型 "${resolvedModelId}": ${msg}`);
+        }
+      }
     }
 
     if (params.thoughtLevel) {

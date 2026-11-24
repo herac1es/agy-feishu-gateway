@@ -698,7 +698,9 @@ export class FeishuAcpGateway {
       case 'model': {
         try {
           const prevThought = record.thoughtLevel;
-          const initialParsed = parseModelCommandArgs(command.arg);
+          const cachedThoughtIds =
+            this.acp.getCachedThoughtLevels?.().map((t) => t.id) ?? [];
+          const initialParsed = parseModelCommandArgs(command.arg, cachedThoughtIds);
           const sessionRecord =
             initialParsed.kind === 'set' && initialParsed.modelId
               ? { ...record, modelId: undefined, thoughtLevel: undefined }
@@ -716,7 +718,7 @@ export class FeishuAcpGateway {
             const hasThoughtOptions = ensured.availableThoughtLevels.length > 0;
             const thoughtSummary = hasThoughtOptions
               ? ensured.availableThoughtLevels.map((t) => t.id).join(' / ')
-              : '（当前模型不支持思考强度）';
+              : '（当前模型未通过 ACP 暴露思考强度选项）';
             const lines = [
               `当前模型：${ensuredRecord.modelId ?? '默认'}`,
               `当前思考强度：${hasThoughtOptions ? (ensuredRecord.thoughtLevel ?? '默认') : '不支持'}`,
@@ -728,6 +730,14 @@ export class FeishuAcpGateway {
               '- /model <思考强度>（仅切强度，如 /model medium）',
               '- /model <模型ID> <思考强度> 或 /model <模型ID>:<思考强度>（同时切换）',
             ];
+            if (
+              !hasThoughtOptions &&
+              ensuredRecord.modelId?.toLowerCase().includes('orchestrator')
+            ) {
+              lines.push(
+                '提示：Orchestrator 的 Planner/Executor 独立思考深度当前需在终端 `agy` 的 `/model`（或 settings.json 的 orchestrator 字段）配置；待 ACP 协议开放后将自动支持在此切换。',
+              );
+            }
             await this.feishu.sendText(target, lines.join('\n'));
             return;
           }

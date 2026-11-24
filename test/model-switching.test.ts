@@ -175,4 +175,102 @@ describe('FeishuAcpGateway /model handling for models without thought_level', ()
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('supports Orchestrator thought_level dynamically once ACP exposes it, and falls back gracefully on retired persisted modelId', async () => {
+    const { AgyAcpClient } = await import('../src/acp/client.js');
+    const client = new AgyAcpClient({ agyBin: 'agy', defaultCwd: '/tmp' });
+    const internal = client as unknown as {
+      connection: unknown;
+      initPromise: Promise<unknown>;
+    };
+
+    let currentModel = 'gemini-4-neon';
+    let currentThought = 'high';
+    const models = [
+      { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+      { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+    ];
+    const orchLevels = [
+      { value: 'low', name: 'Low' },
+      { value: 'medium', name: 'Medium' },
+      { value: 'high', name: 'High' },
+    ];
+
+    const buildConfigOptions = () => [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: currentModel,
+        options: models,
+      },
+      {
+        id: 'thought_level',
+        name: 'Thinking Level',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: currentThought,
+        options: orchLevels,
+      },
+    ];
+
+    internal.connection = {
+      agent: {
+        request: async (method: string, params: Record<string, unknown>) => {
+          if (method === 'session/new') {
+            return {
+              sessionId: 'sess_orch_dynamic',
+              modes: { currentModeId: 'auto', availableModes: [{ id: 'auto', name: 'Auto' }] },
+              configOptions: buildConfigOptions(),
+            };
+          }
+          if (method === 'session/set_config_option') {
+            if (params.configId === 'model') {
+              currentModel = String(params.value);
+              currentThought = 'high';
+            } else if (params.configId === 'thought_level') {
+              currentThought = String(params.value);
+            }
+            return { configOptions: buildConfigOptions() };
+          }
+          if (method === 'session/close') return {};
+          throw new Error(`Unexpected method: ${method}`);
+        },
+        notify: async () => undefined,
+      },
+      close: () => undefined,
+    };
+    internal.initPromise = Promise.resolve({
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
+    });
+
+    // 1. Session persisted with a retired modelId falls back cleanly without throwing
+    const created = await client.ensureSession({
+      cwd: '/tmp',
+      modelId: 'gemini-4-argon-retired',
+      thoughtLevel: 'medium',
+    });
+    assert.equal(created.currentModelId, 'gemini-4-neon');
+    assert.equal(created.currentThoughtLevel, 'medium');
+
+    // 2. Switching to Orchestrator + thought_level works dynamically when ACP exposes thought_level
+    const switched = await client.setSessionConfig(created.sessionId, {
+      modelId: 'gemini-pro-orchestrator-neon',
+      thoughtLevel: 'high',
+    });
+    assert.equal(switched.currentModelId, 'gemini-pro-orchestrator-neon');
+    assert.equal(switched.currentThoughtLevel, 'high');
+    assert.deepEqual(
+      switched.availableThoughtLevels.map((t) => t.id),
+      ['low', 'medium', 'high'],
+    );
+
+    // 3. Explicit unknown model switch still fails clearly
+    await assert.rejects(
+      () => client.setSessionConfig(created.sessionId, { modelId: 'non-existent-model' }),
+      /未知模型/,
+    );
+  });
 });

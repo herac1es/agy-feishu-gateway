@@ -12,7 +12,7 @@ export type ParsedModelCommandArgs =
   | { kind: 'set'; modelId?: string; thoughtLevel?: string };
 
 const GATEWAY_COMMANDS = new Set(['/help', '/status', '/new', '/cwd', '/model', '/stop', '/send']);
-const DEFAULT_THOUGHT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const DEFAULT_THOUGHT_LEVELS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'extra', 'max']);
 
 function unquoteArg(raw: string): string {
   const trimmed = raw.trim();

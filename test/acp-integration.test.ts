@@ -35,34 +35,56 @@ describe('AgyAcpClient integration', () => {
       assert.equal(updatedBoth.currentModelId, 'claude-sonnet-5-5');
       assert.equal(updatedBoth.currentThoughtLevel, 'high');
 
-      // Switch to an Orchestrator model that does not expose thought_level
+      // Switch to an Orchestrator model and verify dynamic thought_level handling
+      // (supports both ACP versions where Orchestrator omits thought_level and newer ones that expose it)
       const orchestratorState = await client.setSessionConfig(session.sessionId, {
         modelId: 'gemini-pro-orchestrator-neon',
       });
       assert.equal(orchestratorState.currentModelId, 'gemini-pro-orchestrator-neon');
-      assert.equal(orchestratorState.currentThoughtLevel, undefined);
-      assert.deepEqual(orchestratorState.availableThoughtLevels, []);
 
-      // Loading an existing Orchestrator session with a stale thoughtLevel must not fail
-      const reloadedOrch = await client.ensureSession({
+      if (orchestratorState.availableThoughtLevels.length === 0) {
+        assert.equal(orchestratorState.currentThoughtLevel, undefined);
+
+        // Loading an existing Orchestrator session with a stale thoughtLevel must not fail
+        const reloadedOrch = await client.ensureSession({
+          cwd: '/home/malishen/github.com/coolbot',
+          sessionId: session.sessionId,
+          modelId: 'gemini-pro-orchestrator-neon',
+          thoughtLevel: 'high',
+        });
+        assert.equal(reloadedOrch.currentModelId, 'gemini-pro-orchestrator-neon');
+        assert.equal(reloadedOrch.currentThoughtLevel, undefined);
+        assert.deepEqual(reloadedOrch.availableThoughtLevels, []);
+
+        // Explicitly requesting a thought level on a model without thought_level must fail cleanly
+        await assert.rejects(
+          () =>
+            client.setSessionConfig(session.sessionId, {
+              thoughtLevel: 'high',
+              knownThoughtLevels: reloadedOrch.availableThoughtLevels,
+            }),
+          /不支持设置思考强度/,
+        );
+      } else {
+        // When ACP exposes thought_level for Orchestrator, setting an offered level must succeed
+        const targetLevel =
+          orchestratorState.availableThoughtLevels.find((t) => t.id === 'high')?.id ??
+          orchestratorState.availableThoughtLevels[0].id;
+        const updatedOrchThought = await client.setSessionConfig(session.sessionId, {
+          thoughtLevel: targetLevel,
+          knownThoughtLevels: orchestratorState.availableThoughtLevels,
+        });
+        assert.equal(updatedOrchThought.currentThoughtLevel, targetLevel);
+      }
+
+      // Persisted retired/unknown modelId must fall back gracefully during ensureSession
+      const retiredFallback = await client.ensureSession({
         cwd: '/home/malishen/github.com/coolbot',
         sessionId: session.sessionId,
-        modelId: 'gemini-pro-orchestrator-neon',
+        modelId: 'retired-legacy-model-v0',
         thoughtLevel: 'high',
       });
-      assert.equal(reloadedOrch.currentModelId, 'gemini-pro-orchestrator-neon');
-      assert.equal(reloadedOrch.currentThoughtLevel, undefined);
-      assert.deepEqual(reloadedOrch.availableThoughtLevels, []);
-
-      // Explicitly requesting a thought level on a model without thought_level must fail cleanly
-      await assert.rejects(
-        () =>
-          client.setSessionConfig(session.sessionId, {
-            thoughtLevel: 'high',
-            knownThoughtLevels: reloadedOrch.availableThoughtLevels,
-          }),
-        /不支持设置思考强度/,
-      );
+      assert.equal(retiredFallback.currentModelId, 'gemini-pro-orchestrator-neon');
 
       // Switch back to flash/neon low for fast PONG prompt check
       const restored = await client.setSessionConfig(session.sessionId, {
