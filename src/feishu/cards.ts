@@ -27,6 +27,7 @@ export interface FeishuCardBuildRunningParams {
 
 export interface FeishuCardBuildFinalParams {
   status: 'completed' | 'cancelled' | 'error';
+  headerTitle?: string;
   text: string;
   thoughtText?: string;
   thoughtElapsedMs?: number;
@@ -399,7 +400,7 @@ function assembleFinalCard(
   includeCotPanel: boolean,
 ): Record<string, unknown> {
   let template: 'green' | 'orange' | 'red' = 'green';
-  let titleText = 'Antigravity';
+  let titleText = params.headerTitle?.trim() || 'Antigravity';
   if (params.status === 'cancelled') {
     template = 'orange';
     titleText = 'Antigravity · 已中止';
@@ -533,4 +534,227 @@ export function buildFinalCard(params: FeishuCardBuildFinalParams): Record<strin
     return assembleFinalCard(params, 0, false);
   }
   return card;
+}
+
+export const INBOUND_MODE_CHOICE_ACTION = 'inbound_mode_choice' as const;
+
+export type InboundModeChoice = 'steer' | 'queue' | 'cancel';
+
+export interface FeishuTurnModeChoiceCardParams {
+  choiceId: string;
+  messagePreview: string;
+  attachmentSummary?: string;
+  queuedCount?: number;
+}
+
+export interface FeishuTurnModeResolvedCardParams {
+  outcome: 'steered' | 'queued' | 'auto_queued' | 'cancelled';
+  messagePreview: string;
+  attachmentSummary?: string;
+  detail?: string;
+}
+
+function formatMessagePreviewBlock(messagePreview: string, attachmentSummary?: string): string {
+  const preview = messagePreview.trim() || '（仅包含附件）';
+  const safePreview = preview.replace(/\r?\n+/g, ' ').trim();
+  const clipped = safePreview.length > 160 ? `${safePreview.slice(0, 159)}…` : safePreview;
+  const lines = [`**收到新消息**\n> ${clipped}`];
+  if (attachmentSummary?.trim()) {
+    lines.push(`<font color='grey'>附件：${attachmentSummary.trim()}</font>`);
+  }
+  return lines.join('\n');
+}
+
+export function buildTurnModeChoiceCard(
+  params: FeishuTurnModeChoiceCardParams,
+): Record<string, unknown> {
+  const hintLines = [
+    '- ⚡ **引导当前任务**：立即注入当前执行中的任务，调整后续步骤',
+    '- 📥 **加入排队**：等待当前任务完成后按顺序执行',
+  ];
+  if (typeof params.queuedCount === 'number' && params.queuedCount > 0) {
+    hintLines.push(`- 当前已有 **${params.queuedCount}** 条消息在排队`);
+  }
+
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      width_mode: 'fill',
+      summary: {
+        content: '任务进行中 · 请选择引导当前任务或加入排队',
+      },
+    },
+    header: {
+      template: 'wathet',
+      title: {
+        tag: 'plain_text',
+        content: '任务进行中 · 选择新消息处理方式',
+      },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '8px',
+      elements: [
+        {
+          tag: 'markdown',
+          content: formatMessagePreviewBlock(params.messagePreview, params.attachmentSummary),
+        },
+        {
+          tag: 'markdown',
+          content: hintLines.join('\n'),
+          text_size: 'notation',
+        },
+        {
+          tag: 'column_set',
+          flex_mode: 'flow',
+          horizontal_spacing: '8px',
+          columns: [
+            {
+              tag: 'column',
+              width: 'auto',
+              elements: [
+                {
+                  tag: 'button',
+                  type: 'primary',
+                  size: 'medium',
+                  text: {
+                    tag: 'plain_text',
+                    content: '⚡ 引导当前任务',
+                  },
+                  behaviors: [
+                    {
+                      type: 'callback',
+                      value: {
+                        kind: INBOUND_MODE_CHOICE_ACTION,
+                        choiceId: params.choiceId,
+                        mode: 'steer',
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              tag: 'column',
+              width: 'auto',
+              elements: [
+                {
+                  tag: 'button',
+                  type: 'default',
+                  size: 'medium',
+                  text: {
+                    tag: 'plain_text',
+                    content: '📥 加入排队',
+                  },
+                  behaviors: [
+                    {
+                      type: 'callback',
+                      value: {
+                        kind: INBOUND_MODE_CHOICE_ACTION,
+                        choiceId: params.choiceId,
+                        mode: 'queue',
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              tag: 'column',
+              width: 'auto',
+              elements: [
+                {
+                  tag: 'button',
+                  type: 'danger_text',
+                  size: 'medium',
+                  text: {
+                    tag: 'plain_text',
+                    content: '取消',
+                  },
+                  behaviors: [
+                    {
+                      type: 'callback',
+                      value: {
+                        kind: INBOUND_MODE_CHOICE_ACTION,
+                        choiceId: params.choiceId,
+                        mode: 'cancel',
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        buildFooterMarkdown('若原任务先完成，未选择的消息将自动按排队执行 · 发送 `/stop` 可中止当前任务'),
+      ],
+    },
+  };
+}
+
+export function buildTurnModeResolvedCard(
+  params: FeishuTurnModeResolvedCardParams,
+): Record<string, unknown> {
+  let template: 'indigo' | 'turquoise' | 'green' | 'grey' = 'green';
+  let titleText = '已处理新消息';
+  let defaultDetail = '';
+
+  switch (params.outcome) {
+    case 'steered':
+      template = 'indigo';
+      titleText = '⚡ 已切入引导当前任务';
+      defaultDetail = '已将这条消息注入当前执行中的任务，模型将在当前步骤后按新指令调整。';
+      break;
+    case 'queued':
+      template = 'turquoise';
+      titleText = '📥 已加入任务排队';
+      defaultDetail = '将等待当前任务完成后按顺序执行。';
+      break;
+    case 'auto_queued':
+      template = 'green';
+      titleText = '✅ 原任务已结束 · 已自动开始执行';
+      defaultDetail = '原任务已完成，这条消息已自动转入执行。';
+      break;
+    case 'cancelled':
+      template = 'grey';
+      titleText = '已取消该消息';
+      defaultDetail = '已放弃提交这条消息，不影响当前任务。';
+      break;
+  }
+
+  const detail = params.detail?.trim() || defaultDetail;
+
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      width_mode: 'fill',
+      summary: {
+        content: titleText,
+      },
+    },
+    header: {
+      template,
+      title: {
+        tag: 'plain_text',
+        content: titleText,
+      },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '8px',
+      elements: [
+        {
+          tag: 'markdown',
+          content: formatMessagePreviewBlock(params.messagePreview, params.attachmentSummary),
+        },
+        {
+          tag: 'markdown',
+          content: `<font color='grey'>${detail}</font>`,
+          text_size: 'notation',
+        },
+      ],
+    },
+  };
 }

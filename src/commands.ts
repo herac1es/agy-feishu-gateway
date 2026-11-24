@@ -128,6 +128,7 @@ export function buildHelpText(defaultCwd: string): string {
     `- /cwd <目录>：切换当前对话的工作目录（默认 ${defaultCwd}，会重建会话）`,
     '- /model [模型] [思考强度]：查看或切换模型与思考强度（支持 `/model medium`、`/model gemini-4-neon`、`/model gemini-4-neon high`、`/model gemini-4-neon:high`）',
     '- /stop：立即中止正在执行的回合（不排队）',
+    '- 运行中追发消息：会弹出交互卡片，可选择「引导当前任务」（实时注入调整）、「加入排队」或「取消」',
     '- /send <文件路径>：直接让网关将本机文件/图片/视频发送到当前对话',
     '- 其他斜杠命令（如 /plan、/compact、/goal）与普通图文/文件消息会直接转发给 agy 执行',
   ].join('\n');

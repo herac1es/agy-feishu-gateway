@@ -77,6 +77,45 @@ export interface FeishuRawMessageReceiveEvent {
   };
 }
 
+export interface FeishuCardActionTriggerEvent {
+  event_id?: string;
+  token?: string;
+  create_time?: string;
+  event_type?: string;
+  tenant_key?: string;
+  operator?: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+    tenant_key?: string;
+  };
+  action?: {
+    value?: Record<string, unknown> | string;
+    tag?: string;
+    name?: string;
+    option?: string;
+    timezone?: string;
+  };
+  host?: string;
+  context?: {
+    open_message_id?: string;
+    open_chat_id?: string;
+  };
+  open_message_id?: string;
+  open_chat_id?: string;
+}
+
+export interface FeishuCardCallbackResponse {
+  toast?: {
+    type: 'info' | 'success' | 'warning' | 'error';
+    content: string;
+  };
+  card?: {
+    type: 'raw';
+    data: Record<string, unknown>;
+  };
+}
+
 export interface FeishuFetchedMessage {
   messageId: string;
   msgType: string;
@@ -683,6 +722,9 @@ export class FeishuGatewayClient {
   async startWebSocket(
     onMessage: (event: FeishuRawMessageReceiveEvent) => void | Promise<void>,
     callbacks?: {
+      onCardAction?: (
+        event: FeishuCardActionTriggerEvent,
+      ) => FeishuCardCallbackResponse | void | Promise<FeishuCardCallbackResponse | void>;
       onReady?: () => void;
       onError?: (err: Error) => void;
       onReconnecting?: () => void;
@@ -692,7 +734,7 @@ export class FeishuGatewayClient {
     if (this.wsClient) {
       return;
     }
-    const dispatcher = new Lark.EventDispatcher({}).register({
+    const handlers: Record<string, (data: unknown) => Promise<unknown>> = {
       'im.message.receive_v1': async (data) => {
         // Dispatch asynchronously so Feishu WS ack returns immediately without blocking on agent turns.
         void Promise.resolve(onMessage(data as FeishuRawMessageReceiveEvent)).catch((err) => {
@@ -700,7 +742,28 @@ export class FeishuGatewayClient {
         });
         return {};
       },
-    });
+    };
+
+    if (callbacks?.onCardAction) {
+      const onCardAction = callbacks.onCardAction;
+      handlers['card.action.trigger'] = async (data) => {
+        try {
+          const response = await onCardAction(data as FeishuCardActionTriggerEvent);
+          return response ?? {};
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[gateway] 处理飞书卡片回调异常:', msg);
+          return {
+            toast: {
+              type: 'error',
+              content: `操作失败：${msg.slice(0, 80)}`,
+            },
+          } satisfies FeishuCardCallbackResponse;
+        }
+      };
+    }
+
+    const dispatcher = new Lark.EventDispatcher({}).register(handlers);
 
     this.wsClient = new Lark.WSClient({
       appId: this.config.feishuAppId,

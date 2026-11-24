@@ -53,6 +53,15 @@ export interface AcpPromptResult {
   usage: AcpUsageSummary;
 }
 
+export interface AcpAsyncTurnResult {
+  sessionId: string;
+  text: string;
+  thoughtText: string;
+  toolEvents: AcpToolEvent[];
+  usage: AcpUsageSummary;
+  elapsedMs: number;
+}
+
 export interface EnsureSessionParams {
   cwd: string;
   sessionId?: string;
@@ -66,13 +75,33 @@ export interface EnsureSessionResult extends AcpSessionConfigState {
   currentModeId?: string;
 }
 
+interface ActiveSessionState extends AcpSessionConfigState {
+  sessionId: string;
+  cwd: string;
+  currentModeId?: string;
+}
+
 interface ActiveTurnCollector {
   text: string;
   thoughtText: string;
   lastEventWasThought: boolean;
+  lastEventWasTool: boolean;
   toolEventsMap: Map<string, AcpToolEvent>;
   usage: AcpUsageSummary;
   handlers: AcpPromptHandlers;
+  currentPromptPromise?: Promise<acp.PromptResponse>;
+  steerSeq: number;
+}
+
+interface AsyncTurnBuffer {
+  startedAt: number;
+  text: string;
+  thoughtText: string;
+  lastEventWasThought: boolean;
+  lastEventWasTool: boolean;
+  toolEventsMap: Map<string, AcpToolEvent>;
+  usage: AcpUsageSummary;
+  settleTimer: NodeJS.Timeout | null;
 }
 
 function summarizeRawInput(rawInput: unknown): string {
@@ -184,17 +213,22 @@ function flattenSelectOptions(
   return items;
 }
 
-function extractConfigFromSessionResponse(resp: unknown): AcpSessionConfigState {
+interface ExtractedSessionConfig extends AcpSessionConfigState {
+  hasConfigOptions: boolean;
+}
+
+function extractConfigFromSessionResponse(resp: unknown): ExtractedSessionConfig {
   if (!resp || typeof resp !== 'object') {
-    return { availableModels: [], availableThoughtLevels: [] };
+    return { availableModels: [], availableThoughtLevels: [], hasConfigOptions: false };
   }
   const obj = resp as Record<string, unknown>;
   let availableModels: AcpModelOption[] = [];
   let currentModelId: string | undefined;
   let availableThoughtLevels: AcpThoughtLevelOption[] = [];
   let currentThoughtLevel: string | undefined;
+  const hasConfigOptions = Array.isArray(obj.configOptions);
 
-  if (Array.isArray(obj.configOptions)) {
+  if (hasConfigOptions) {
     for (const opt of obj.configOptions as acp.SessionConfigOption[]) {
       if (opt.type !== 'select') continue;
       if (opt.id === 'model' || opt.category === 'model') {
@@ -233,6 +267,7 @@ function extractConfigFromSessionResponse(resp: unknown): AcpSessionConfigState 
     availableModels,
     currentThoughtLevel,
     availableThoughtLevels,
+    hasConfigOptions,
   };
 }
 
@@ -243,7 +278,13 @@ export class AgyAcpClient {
   private agentInfo: acp.Implementation | null = null;
   private cachedModels: AcpModelOption[] = [];
   private cachedThoughtLevels: AcpThoughtLevelOption[] = [];
+  private loadedSessions = new Map<string, ActiveSessionState>();
+  private replayingSessions = new Set<string>();
   private activeCollectors = new Map<string, ActiveTurnCollector>();
+  private asyncBuffers = new Map<string, AsyncTurnBuffer>();
+  private asyncTurnHandler: ((result: AcpAsyncTurnResult) => void | Promise<void>) | null = null;
+  private readonly asyncSettleAfterUsageMs: number;
+  private readonly asyncSettleFallbackMs: number;
   private shuttingDown = false;
 
   constructor(
@@ -252,8 +293,85 @@ export class AgyAcpClient {
       defaultCwd: string;
       systemPromptAppend?: string;
       logger?: (msg: string) => void;
+      onAsyncTurn?: (result: AcpAsyncTurnResult) => void | Promise<void>;
+      asyncSettleAfterUsageMs?: number;
+      asyncSettleFallbackMs?: number;
     },
-  ) {}
+  ) {
+    this.asyncTurnHandler = options.onAsyncTurn ?? null;
+    this.asyncSettleAfterUsageMs = Math.max(20, options.asyncSettleAfterUsageMs ?? 1500);
+    this.asyncSettleFallbackMs = Math.max(
+      this.asyncSettleAfterUsageMs,
+      options.asyncSettleFallbackMs ?? 4500,
+    );
+  }
+
+  setAsyncTurnHandler(
+    handler: ((result: AcpAsyncTurnResult) => void | Promise<void>) | null,
+  ): void {
+    this.asyncTurnHandler = handler;
+  }
+
+  takePendingAsyncTurn(sessionId: string): AcpAsyncTurnResult | null {
+    const buffer = this.asyncBuffers.get(sessionId);
+    if (!buffer) {
+      return null;
+    }
+    this.clearAsyncBuffer(sessionId, buffer);
+    if (!buffer.text.trim()) {
+      return null;
+    }
+    return this.buildAsyncTurnResult(sessionId, buffer);
+  }
+
+  private clearAsyncBuffer(sessionId: string, buffer?: AsyncTurnBuffer): void {
+    const target = buffer ?? this.asyncBuffers.get(sessionId);
+    if (!target) {
+      return;
+    }
+    if (target.settleTimer) {
+      clearTimeout(target.settleTimer);
+      target.settleTimer = null;
+    }
+    if (this.asyncBuffers.get(sessionId) === target) {
+      this.asyncBuffers.delete(sessionId);
+    }
+  }
+
+  private buildAsyncTurnResult(sessionId: string, buffer: AsyncTurnBuffer): AcpAsyncTurnResult {
+    return {
+      sessionId,
+      text: buffer.text.trim(),
+      thoughtText: buffer.thoughtText.trim(),
+      toolEvents: Array.from(buffer.toolEventsMap.values()),
+      usage: { ...buffer.usage },
+      elapsedMs: Math.max(1, Date.now() - buffer.startedAt),
+    };
+  }
+
+  private scheduleAsyncSettle(sessionId: string, buffer: AsyncTurnBuffer, delayMs: number): void {
+    if (buffer.settleTimer) {
+      clearTimeout(buffer.settleTimer);
+    }
+    buffer.settleTimer = setTimeout(() => {
+      buffer.settleTimer = null;
+      if (this.asyncBuffers.get(sessionId) !== buffer) {
+        return;
+      }
+      this.asyncBuffers.delete(sessionId);
+      if (!buffer.text.trim()) {
+        return;
+      }
+      const result = this.buildAsyncTurnResult(sessionId, buffer);
+      if (this.asyncTurnHandler) {
+        void Promise.resolve(this.asyncTurnHandler(result)).catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log(`[agy acp] 异步回合回调异常 (${sessionId}): ${msg}`);
+        });
+      }
+    }, delayMs);
+    buffer.settleTimer.unref?.();
+  }
 
   private log(msg: string): void {
     this.options.logger?.(msg);
@@ -263,6 +381,12 @@ export class AgyAcpClient {
     this.connection = null;
     this.child = null;
     this.initPromise = null;
+    this.loadedSessions.clear();
+    this.replayingSessions.clear();
+    for (const [sessionId, buffer] of this.asyncBuffers.entries()) {
+      this.clearAsyncBuffer(sessionId, buffer);
+    }
+    this.asyncBuffers.clear();
   }
 
   private async ensureConnected(): Promise<{
@@ -381,18 +505,44 @@ export class AgyAcpClient {
   }
 
   private handleSessionUpdate(notification: acp.SessionNotification): void {
-    const collector = this.activeCollectors.get(notification.sessionId);
-    if (!collector) {
+    const { sessionId, update } = notification;
+    if (this.replayingSessions.has(sessionId)) {
       return;
     }
 
-    const { update } = notification;
+    if (update.sessionUpdate === 'config_option_update') {
+      const existingSession = this.loadedSessions.get(sessionId);
+      if (existingSession) {
+        const merged = this.mergeCachedConfig(extractConfigFromSessionResponse(update));
+        this.loadedSessions.set(sessionId, {
+          ...existingSession,
+          ...merged,
+        });
+      }
+      return;
+    }
+
+    const collector = this.activeCollectors.get(sessionId);
+    if (!collector) {
+      if (this.loadedSessions.has(sessionId)) {
+        this.handleUnsolicitedSessionUpdate(sessionId, update);
+      }
+      return;
+    }
+
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
         if (update.content.type === 'text' && update.content.text) {
+          const needsBreak =
+            collector.lastEventWasTool &&
+            collector.text.length > 0 &&
+            !collector.text.endsWith('\n') &&
+            !update.content.text.startsWith('\n');
+          const piece = needsBreak ? `\n\n${update.content.text}` : update.content.text;
           collector.lastEventWasThought = false;
-          collector.text += update.content.text;
-          collector.handlers.onTextChunk?.(collector.text, update.content.text);
+          collector.lastEventWasTool = false;
+          collector.text += piece;
+          collector.handlers.onTextChunk?.(collector.text, piece);
         }
         break;
       }
@@ -404,6 +554,7 @@ export class AgyAcpClient {
             !collector.thoughtText.endsWith('\n');
           const piece = needsBreak ? `\n\n${update.content.text}` : update.content.text;
           collector.lastEventWasThought = true;
+          collector.lastEventWasTool = false;
           collector.thoughtText += piece;
           collector.handlers.onThoughtChunk?.(collector.thoughtText, piece);
         }
@@ -412,6 +563,7 @@ export class AgyAcpClient {
       case 'tool_call':
       case 'tool_call_update': {
         collector.lastEventWasThought = false;
+        collector.lastEventWasTool = true;
         const existing = collector.toolEventsMap.get(update.toolCallId);
         const name =
           typeof update.name === 'string' && update.name.trim()
@@ -443,6 +595,108 @@ export class AgyAcpClient {
     }
   }
 
+  private getOrCreateAsyncBuffer(sessionId: string): AsyncTurnBuffer {
+    let buffer = this.asyncBuffers.get(sessionId);
+    if (!buffer) {
+      buffer = {
+        startedAt: Date.now(),
+        text: '',
+        thoughtText: '',
+        lastEventWasThought: false,
+        lastEventWasTool: false,
+        toolEventsMap: new Map(),
+        usage: {},
+        settleTimer: null,
+      };
+      this.asyncBuffers.set(sessionId, buffer);
+    }
+    return buffer;
+  }
+
+  private handleUnsolicitedSessionUpdate(
+    sessionId: string,
+    update: acp.SessionNotification['update'],
+  ): void {
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk': {
+        if (update.content.type === 'text' && update.content.text) {
+          const buffer = this.getOrCreateAsyncBuffer(sessionId);
+          const needsBreak =
+            buffer.lastEventWasTool &&
+            buffer.text.length > 0 &&
+            !buffer.text.endsWith('\n') &&
+            !update.content.text.startsWith('\n');
+          const piece = needsBreak ? `\n\n${update.content.text}` : update.content.text;
+          buffer.lastEventWasThought = false;
+          buffer.lastEventWasTool = false;
+          buffer.text += piece;
+          this.scheduleAsyncSettle(sessionId, buffer, this.asyncSettleFallbackMs);
+        }
+        break;
+      }
+      case 'agent_thought_chunk': {
+        if (update.content.type === 'text' && update.content.text) {
+          const buffer = this.getOrCreateAsyncBuffer(sessionId);
+          if (buffer.settleTimer) {
+            clearTimeout(buffer.settleTimer);
+            buffer.settleTimer = null;
+          }
+          const needsBreak =
+            !buffer.lastEventWasThought &&
+            buffer.thoughtText.length > 0 &&
+            !buffer.thoughtText.endsWith('\n');
+          const piece = needsBreak ? `\n\n${update.content.text}` : update.content.text;
+          buffer.lastEventWasThought = true;
+          buffer.lastEventWasTool = false;
+          buffer.thoughtText += piece;
+        }
+        break;
+      }
+      case 'tool_call':
+      case 'tool_call_update': {
+        const buffer = this.getOrCreateAsyncBuffer(sessionId);
+        if (buffer.settleTimer) {
+          clearTimeout(buffer.settleTimer);
+          buffer.settleTimer = null;
+        }
+        buffer.lastEventWasThought = false;
+        buffer.lastEventWasTool = true;
+        const existing = buffer.toolEventsMap.get(update.toolCallId);
+        const name =
+          typeof update.name === 'string' && update.name.trim()
+            ? update.name.trim()
+            : existing?.name;
+        const argsText = serializeBoundedValue(update.rawInput, 800) ?? existing?.argsText;
+        const resultText = extractToolResultText(update, 1000) ?? existing?.resultText;
+        const event: AcpToolEvent = {
+          toolCallId: update.toolCallId,
+          label: formatToolLabel(update, existing),
+          status: update.status ?? existing?.status ?? 'in_progress',
+          kind: update.kind ?? existing?.kind,
+          name,
+          argsText,
+          resultText,
+        };
+        buffer.toolEventsMap.set(update.toolCallId, event);
+        break;
+      }
+      case 'usage_update': {
+        const buffer = this.asyncBuffers.get(sessionId);
+        if (!buffer) {
+          return;
+        }
+        buffer.usage.contextUsed = update.used;
+        buffer.usage.contextSize = update.size;
+        if (buffer.text.trim().length > 0) {
+          this.scheduleAsyncSettle(sessionId, buffer, this.asyncSettleAfterUsageMs);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
   async initialize(): Promise<acp.InitializeResponse> {
     const { init } = await this.ensureConnected();
     return init;
@@ -460,21 +714,18 @@ export class AgyAcpClient {
     return [...this.cachedThoughtLevels];
   }
 
-  private mergeCachedConfig(extracted: AcpSessionConfigState): AcpSessionConfigState {
+  private mergeCachedConfig(extracted: ExtractedSessionConfig): AcpSessionConfigState {
     if (extracted.availableModels.length > 0) {
       this.cachedModels = extracted.availableModels;
     }
-    if (extracted.availableThoughtLevels.length > 0) {
+    if (extracted.hasConfigOptions) {
       this.cachedThoughtLevels = extracted.availableThoughtLevels;
     }
     return {
       currentModelId: extracted.currentModelId,
       availableModels: this.getCachedModels(),
       currentThoughtLevel: extracted.currentThoughtLevel,
-      availableThoughtLevels:
-        extracted.availableThoughtLevels.length > 0
-          ? extracted.availableThoughtLevels
-          : this.getCachedThoughtLevels(),
+      availableThoughtLevels: extracted.hasConfigOptions ? extracted.availableThoughtLevels : [],
     };
   }
 
@@ -485,11 +736,76 @@ export class AgyAcpClient {
       ? { antigravity: { systemPrompt: { append: systemAppend } } }
       : undefined;
 
+    // Fast path: reuse an already-loaded session in this ACP process without triggering
+    // `session/load` history replay or tearing down the live conversation update stream.
+    if (params.sessionId) {
+      const cached = this.loadedSessions.get(params.sessionId);
+      if (cached && cached.cwd === params.cwd) {
+        let configState: AcpSessionConfigState = {
+          currentModelId: cached.currentModelId,
+          availableModels:
+            cached.availableModels.length > 0 ? cached.availableModels : this.getCachedModels(),
+          currentThoughtLevel: cached.currentThoughtLevel,
+          availableThoughtLevels: cached.availableThoughtLevels,
+        };
+        const needsModelSwitch = Boolean(
+          params.modelId && params.modelId !== configState.currentModelId,
+        );
+        const desiredThought = params.thoughtLevel?.trim();
+        const canApplyThought =
+          Boolean(desiredThought) &&
+          (needsModelSwitch ||
+            (desiredThought !== configState.currentThoughtLevel &&
+              configState.availableThoughtLevels.some(
+                (t) => t.id.toLowerCase() === desiredThought!.toLowerCase(),
+              )));
+
+        if (needsModelSwitch || canApplyThought) {
+          configState = await this.setSessionConfig(cached.sessionId, {
+            modelId: needsModelSwitch ? params.modelId : undefined,
+            thoughtLevel: canApplyThought ? desiredThought : undefined,
+            ignoreUnsupportedThoughtLevel: true,
+            knownThoughtLevels: configState.availableThoughtLevels,
+          });
+        }
+
+        return {
+          sessionId: cached.sessionId,
+          loaded: true,
+          currentModeId: cached.currentModeId,
+          ...configState,
+        };
+      }
+    }
+
     let sessionId = params.sessionId;
     let loaded = false;
-    let resp: acp.NewSessionResponse | acp.LoadSessionResponse | undefined;
+    let resp: acp.NewSessionResponse | acp.LoadSessionResponse | acp.ResumeSessionResponse | undefined;
 
-    if (sessionId && init.agentCapabilities?.loadSession) {
+    const caps = init.agentCapabilities as
+      | (acp.AgentCapabilities & { session_capabilities?: { resume?: unknown } })
+      | undefined;
+    const supportsResume = Boolean(
+      caps?.sessionCapabilities?.resume !== undefined ||
+        caps?.session_capabilities?.resume !== undefined,
+    );
+
+    if (sessionId && supportsResume) {
+      try {
+        resp = await connection.agent.request(acp.methods.agent.session.resume, {
+          sessionId,
+          cwd: params.cwd,
+          mcpServers: [],
+          _meta: meta,
+        });
+        loaded = true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log(`[agy acp] resumeSession(${sessionId}) 失败，将创建新会话: ${msg}`);
+        sessionId = undefined;
+      }
+    } else if (sessionId && init.agentCapabilities?.loadSession) {
+      this.replayingSessions.add(sessionId);
       try {
         resp = await connection.agent.request(acp.methods.agent.session.load, {
           sessionId,
@@ -502,6 +818,8 @@ export class AgyAcpClient {
         const msg = err instanceof Error ? err.message : String(err);
         this.log(`[agy acp] loadSession(${sessionId}) 失败，将创建新会话: ${msg}`);
         sessionId = undefined;
+      } finally {
+        this.replayingSessions.delete(params.sessionId!);
       }
     }
 
@@ -533,25 +851,38 @@ export class AgyAcpClient {
     }
 
     let configState = this.mergeCachedConfig(extractConfigFromSessionResponse(resp));
+    this.loadedSessions.set(sessionId, {
+      sessionId,
+      cwd: params.cwd,
+      currentModeId,
+      ...configState,
+    });
 
     const needsModelSwitch = Boolean(params.modelId && params.modelId !== configState.currentModelId);
     const desiredThought = params.thoughtLevel?.trim();
     const canApplyThought =
-      Boolean(desiredThought && desiredThought !== configState.currentThoughtLevel) &&
+      Boolean(desiredThought) &&
       (needsModelSwitch ||
-        configState.availableThoughtLevels.length === 0 ||
-        configState.availableThoughtLevels.some(
-          (t) => t.id.toLowerCase() === desiredThought!.toLowerCase(),
-        ));
+        (desiredThought !== configState.currentThoughtLevel &&
+          configState.availableThoughtLevels.some(
+            (t) => t.id.toLowerCase() === desiredThought!.toLowerCase(),
+          )));
 
     if (needsModelSwitch || canApplyThought) {
       configState = await this.setSessionConfig(sessionId, {
         modelId: needsModelSwitch ? params.modelId : undefined,
-        thoughtLevel: desiredThought && (!needsModelSwitch || canApplyThought) ? desiredThought : undefined,
+        thoughtLevel: canApplyThought ? desiredThought : undefined,
         ignoreUnsupportedThoughtLevel: true,
         knownThoughtLevels: configState.availableThoughtLevels,
       });
     }
+
+    this.loadedSessions.set(sessionId, {
+      sessionId,
+      cwd: params.cwd,
+      currentModeId,
+      ...configState,
+    });
 
     return {
       sessionId,
@@ -571,6 +902,7 @@ export class AgyAcpClient {
     },
   ): Promise<AcpSessionConfigState> {
     const { connection } = await this.ensureConnected();
+    let thoughtLevelsKnown = params.knownThoughtLevels !== undefined;
     let state: AcpSessionConfigState = {
       availableModels: this.getCachedModels(),
       availableThoughtLevels: params.knownThoughtLevels ?? this.getCachedThoughtLevels(),
@@ -595,7 +927,9 @@ export class AgyAcpClient {
         configId: 'model',
         value: resolvedModelId,
       });
-      state = this.mergeCachedConfig(extractConfigFromSessionResponse(res));
+      const extracted = extractConfigFromSessionResponse(res);
+      thoughtLevelsKnown = extracted.hasConfigOptions;
+      state = this.mergeCachedConfig(extracted);
     }
 
     if (params.thoughtLevel) {
@@ -604,21 +938,52 @@ export class AgyAcpClient {
       const matched = levels.find(
         (t) => t.id.toLowerCase() === requestedThought.toLowerCase(),
       );
+      const modelSuffix = state.currentModelId ? ` ${state.currentModelId}` : '';
+      if (thoughtLevelsKnown && levels.length === 0) {
+        if (!params.ignoreUnsupportedThoughtLevel) {
+          throw new Error(`当前模型${modelSuffix}不支持设置思考强度。`);
+        }
+        return state;
+      }
       if (levels.length > 0 && !matched) {
         if (!params.ignoreUnsupportedThoughtLevel) {
           throw new Error(
-            `当前模型 ${state.currentModelId ?? ''} 不支持思考强度 "${requestedThought}"。可选值：${levels.map((t) => t.id).join(', ')}`,
+            `当前模型${modelSuffix}不支持思考强度 "${requestedThought}"。可选值：${levels.map((t) => t.id).join(', ')}`,
           );
         }
         return state;
       }
 
-      const res = await connection.agent.request(acp.methods.agent.session.setConfigOption, {
-        sessionId,
-        configId: 'thought_level',
-        value: matched ? matched.id : requestedThought,
+      const targetThought = matched ? matched.id : requestedThought;
+      if (
+        state.currentThoughtLevel &&
+        state.currentThoughtLevel.toLowerCase() === targetThought.toLowerCase()
+      ) {
+        return state;
+      }
+
+      try {
+        const res = await connection.agent.request(acp.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: 'thought_level',
+          value: targetThought,
+        });
+        state = this.mergeCachedConfig(extractConfigFromSessionResponse(res));
+      } catch (err) {
+        if (!params.ignoreUnsupportedThoughtLevel) {
+          throw err;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log(`[agy acp] 忽略不兼容的思考强度 "${targetThought}": ${msg}`);
+      }
+    }
+
+    const existingSession = this.loadedSessions.get(sessionId);
+    if (existingSession) {
+      this.loadedSessions.set(sessionId, {
+        ...existingSession,
+        ...state,
       });
-      state = this.mergeCachedConfig(extractConfigFromSessionResponse(res));
     }
 
     return state;
@@ -635,21 +1000,51 @@ export class AgyAcpClient {
     handlers: AcpPromptHandlers = {},
   ): Promise<AcpPromptResult> {
     const { connection } = await this.ensureConnected();
+    this.clearAsyncBuffer(sessionId);
     const collector: ActiveTurnCollector = {
       text: '',
       thoughtText: '',
       lastEventWasThought: false,
+      lastEventWasTool: false,
       toolEventsMap: new Map(),
       usage: {},
       handlers,
+      steerSeq: 0,
     };
     this.activeCollectors.set(sessionId, collector);
 
     try {
-      const response = await connection.agent.request(acp.methods.agent.session.prompt, {
+      let activePromise = connection.agent.request(acp.methods.agent.session.prompt, {
         sessionId,
         prompt: blocks,
       });
+      collector.currentPromptPromise = activePromise;
+
+      let response: acp.PromptResponse;
+      while (true) {
+        let settledResponse: acp.PromptResponse | undefined;
+        let settledError: unknown;
+        let failed = false;
+        try {
+          settledResponse = await activePromise;
+        } catch (err) {
+          failed = true;
+          settledError = err;
+        }
+
+        // If `steer()` replaced `currentPromptPromise` while we were awaiting `activePromise`,
+        // `agy acp` resolves the previous prompt early and continues streaming on the new prompt.
+        if (collector.currentPromptPromise && collector.currentPromptPromise !== activePromise) {
+          activePromise = collector.currentPromptPromise;
+          continue;
+        }
+
+        if (failed) {
+          throw settledError;
+        }
+        response = settledResponse!;
+        break;
+      }
 
       const respObj = response as acp.PromptResponse & {
         usage?: {
@@ -674,11 +1069,42 @@ export class AgyAcpClient {
         usage: collector.usage,
       };
     } finally {
-      this.activeCollectors.delete(sessionId);
+      if (this.activeCollectors.get(sessionId) === collector) {
+        this.activeCollectors.delete(sessionId);
+      }
     }
   }
 
+  /**
+   * Injects a steering prompt into an already-running `prompt()` turn on the same session.
+   * Returns `true` if a live turn accepted the steer, or `false` if no turn is active.
+   */
+  async steer(sessionId: string, blocks: acp.ContentBlock[]): Promise<boolean> {
+    const collector = this.activeCollectors.get(sessionId);
+    if (!collector || !this.connection) {
+      return false;
+    }
+
+    // Prevent unhandled rejections if the superseded prompt fails after handover.
+    collector.currentPromptPromise?.catch(() => undefined);
+
+    collector.steerSeq += 1;
+    if (collector.text.length > 0) {
+      collector.lastEventWasTool = true;
+    }
+
+    const nextPromise = this.connection.agent.request(acp.methods.agent.session.prompt, {
+      sessionId,
+      prompt: blocks,
+    });
+    // Guard against rejections arriving before the active prompt loop switches to `nextPromise`.
+    nextPromise.catch(() => undefined);
+    collector.currentPromptPromise = nextPromise;
+    return true;
+  }
+
   async cancel(sessionId: string): Promise<void> {
+    this.clearAsyncBuffer(sessionId);
     if (!this.connection) {
       return;
     }
@@ -688,6 +1114,9 @@ export class AgyAcpClient {
   }
 
   async closeSession(sessionId: string): Promise<void> {
+    this.clearAsyncBuffer(sessionId);
+    this.loadedSessions.delete(sessionId);
+    this.replayingSessions.delete(sessionId);
     if (!this.connection) {
       return;
     }
